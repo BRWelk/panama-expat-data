@@ -1,16 +1,34 @@
-﻿City/Neighborhood,Date,Configuration,Average Price,Year,Month,Price Trend Analysis,City Rent Summary
-Boquete,7/1/2025,1 BR / 1 BA,700,2025,7,No significant trend detected.,"In Boquete, rent prices average $700 for 1 BR / 1 BA."
-Boquete,7/1/2025,2 BR / 1 BA,1125,2025,7,No significant trend detected.,"In Boquete, the average rent for a 2 BR / 1 BA is $1125."
-Boquete,7/1/2025,2 BR / 2 BA,1300,2025,7,No significant trend detected.,"In Boquete, the average rent for a 2 BR / 2 BA is $1300."
-Coronado,7/1/2025,1 BR / 1 BA,660,2025,7,No significant trend detected.,"In Coronado, the average rent for a 1 BR / 1 BA is $660."
-Coronado,7/1/2025,2 BR / 1 BA,1300,2025,7,No significant trend detected.,"In Coronado, the average rent for a 2 BR / 1 BA is $1300."
-Coronado,7/1/2025,2 BR / 2 BA,1500,2025,7,No significant trend detected.,"In Coronado, the average rent for a 2 BR / 2 BA is $1500."
-Punta Pacífica,7/1/2025,1 BR / 1 BA,1950,2025,7,No significant trend detected.,"In Punta Pacífica, 1 BR / 1 BA rentals average $1950."
-Punta Pacífica,7/1/2025,2 BR / 1 BA,2600,2025,7,No significant trend detected.,"In Punta Pacífica, the average rent for a 2 BR / 1 BA is $2,600."
-Punta Pacífica,7/1/2025,2 BR / 2 BA,3000,2025,7,No significant trend detected.,"In Punta Pacífica, 2 BR / 2 BA rentals average $3000."
-Casco Viejo,7/1/2025,1 BR / 1 BA,1200,2025,7,No significant trend detected.,"In Casco Viejo, the average rent for a 1 BR / 1 BA is $1200."
-Casco Viejo,7/1/2025,2 BR / 1 BA,2000,2025,7,No significant trend detected.,"In Casco Viejo, the average rent for a 2 BR / 1 BA is $2000."
-Casco Viejo,7/1/2025,2 BR / 2 BA,1800,2025,7,No significant trend detected.,"In Casco Viejo, the average rent for a 2 BR / 2 BA is $1800."
-Costa del Este,7/1/2025,1 BR / 1 BA,1100,2025,7,No significant trend detected.,"In Costa del Este, 1 BR / 1 BA rentals average $1100."
-Costa del Este,7/1/2025,2 BR / 1 BA,2200,2025,7,No significant trend detected.,"In Costa del Este, the average rent for a 2 BR / 1 BA is $2200."
-Costa del Este,7/1/2025,2 BR / 2 BA,2800,2025,7,No significant trend detected.,"In Costa del Este, 2 BR / 2 BA rentals average $2800."
+﻿Date,City/Neighborhood,Configuration,Average Price (USD),Utilities,Groceries,Internet,Cell Phone,Dining,Entertainment,Travel
+7/1/2025,Panama City,1 BR / 1 BA,800,120,275,35,30,180,300,30
+7/1/2025,Panama City,2 BR / 1 BA,1150,120,275,35,30,180,300,30
+7/1/2025,Panama City,2 BR / 2 BA,1500,120,275,35,30,180,300,30
+7/1/2025,Bocas del Toro,1 BR / 1 BA,500,150,220,35,30,150,200,40
+7/1/2025,Bocas del Toro,2 BR / 1 BA,650,150,220,35,30,150,200,40
+7/1/2025,Bocas del Toro,2 BR / 2 BA,900,150,220,35,30,150,200,40
+7/1/2025,Coronado,1 BR / 1 BA,750,70,250,50,30,150,250,30
+7/1/2025,Coronado,2 BR / 1 BA,1100,70,250,50,30,150,250,30
+7/1/2025,Coronado,2 BR / 2 BA,1500,70,250,50,30,150,250,30
+7/1/2025,Boquete,1 BR / 1 BA,755,40,200,50,30,100,200,20
+7/1/2025,Boquete,2 BR / 1 BA,950,40,200,50,30,100,200,20
+7/1/2025,Boquete,2 BR / 2 BA,1300,40,200,50,30,100,200,20
+7/1/2025,El Valle de Anton,1 BR / 1 BA,550,40,200,50,30,100,150,20
+7/1/2025,El Valle de Anton,2 BR / 1 BA,800,40,200,50,30,100,150,20
+7/1/2025,El Valle de Anton,2 BR / 2 BA,1200,40,200,50,30,100,150,20
+7/1/2025,David,1 BR / 1 BA,1200,80,200,50,30,120,250,30
+7/1/2025,David,2 BR / 1 BA,1800,80,200,50,30,120,250,30
+7/1/2025,David,2 BR / 2 BA,2400,80,200,50,30,120,250,30
+7/1/2025,Pedasí,1 BR / 1 BA,600,70,200,50,30,150,200,30
+7/1/2025,Pedasí,2 BR / 1 BA,800,70,200,50,30,150,200,30
+7/1/2025,Pedasí,2 BR / 2 BA,1200,70,200,50,30,150,200,30
+7/1/2025,Volcán,1 BR / 1 BA,350,30,250,40,30,150,150,30
+7/1/2025,Volcán,2 BR / 1 BA,550,30,250,40,30,150,150,30
+7/1/2025,Volcán,2 BR / 2 BA,700,30,250,40,30,150,150,30
+7/1/2025,Chitré,1 BR / 1 BA,400,60,200,50,30,150,200,30
+7/1/2025,Chitré,2 BR / 1 BA,550,60,200,50,30,150,200,30
+7/1/2025,Chitré,2 BR / 2 BA,600,60,200,50,30,150,200,30
+7/1/2025,Casco Viejo,1 BR / 1 BA,1200,120,275,35,30,200,350,30
+7/1/2025,Casco Viejo,2 BR / 1 BA,1600,120,275,35,30,200,350,30
+7/1/2025,Casco Viejo,2 BR / 2 BA,2000,120,275,35,30,200,350,30
+7/1/2025,Avenida Balboa,1 BR / 1 BA,1100,120,275,35,30,220,350,30
+7/1/2025,Avenida Balboa,2 BR / 1 BA,1600,120,275,35,30,220,350,30
+7/1/2025,Avenida Balboa,2 BR / 2 BA,2100,120,275,35,30,220,350,30
