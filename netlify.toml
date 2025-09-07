@@ -1,0 +1,19 @@
+[build]
+  publish = "."
+  command = ""
+
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
+[[redirects]]
+  from = "/api/rents"
+  to = "/.netlify/functions/air-proxy?t=rents"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/overrides"
+  to = "/.netlify/functions/air-proxy?t=overrides"
+  status = 200
+  force = true
