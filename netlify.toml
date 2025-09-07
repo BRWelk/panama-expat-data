@@ -5,15 +5,11 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
+  node_js_version = "20"
 
+# Route all /api/* requests to the proxy function.
 [[redirects]]
-  from = "/api/rents"
-  to = "/.netlify/functions/air-proxy?t=rents"
-  status = 200
-  force = true
-
-[[redirects]]
-  from = "/api/overrides"
-  to = "/.netlify/functions/air-proxy?t=overrides"
+  from = "/api/*"
+  to = "/.netlify/functions/air-proxy/:splat"
   status = 200
   force = true
