@@ -17,6 +17,7 @@ REPO_DIR = Path(__file__).resolve().parent
 DATA_DIR = REPO_DIR / "data"
 CSV_PATH = DATA_DIR / "panama_rent_averages.csv"
 HIST_DIR = DATA_DIR / "history"
+QA_DIR   = DATA_DIR / "QA"
 ENV_PATH = REPO_DIR / ".env.local"
 print(f"[RUNNING] {__file__}")
 
@@ -29,27 +30,20 @@ CATEGORIES = ["Utilities","Groceries","Internet","Cell Phone","Dining","Entertai
 
 # ---- Category normalization map (incoming -> canonical) ----
 CAT_MAP = {
-    "utilities": "Utilities",
-    "utility": "Utilities",
-    "groceries": "Groceries",
-    "grocery": "Groceries",
+    "utilities": "Utilities", "utility": "Utilities",
+    "groceries": "Groceries", "grocery": "Groceries",
     "internet": "Internet",
-    "cell phone": "Cell Phone",
-    "cellphone": "Cell Phone",
-    "mobile": "Cell Phone",
-    "dining": "Dining",
-    "dining out": "Dining",
-    "restaurants": "Dining",
+    "cell phone": "Cell Phone", "cellphone": "Cell Phone", "mobile": "Cell Phone",
+    "dining": "Dining", "dining out": "Dining", "restaurants": "Dining",
     "entertainment": "Entertainment",
-    "travel": "Travel",
-    "transportation": "Travel",
+    "travel": "Travel", "transportation": "Travel",
 }
 
 # ---- Neighborhood → City aliases (keys lowercased/slugged) ----
 ALIASES = {
     "avenida balboa": "Panama City",
     "casco viejo": "Panama City",
-    # add more if needed, e.g. "costa del este": "Panama City"
+    # add more if needed (e.g., "costa del este": "Panama City")
 }
 
 # ====== env loader ======
@@ -130,7 +124,7 @@ RENTS_FIELDS = [
     "average_price_usd",
 ]
 
-# We cannot rely on 'category' label (it returns rec IDs). Use key field: "key_city_category".
+# We cannot read the label from 'category' (returns rec IDs). Use key field: "key_city_category".
 OVERRIDES_FIELDS = [
     "city","city_link",
     "category",                  # rec IDs (ignored for label)
@@ -168,10 +162,7 @@ def canonicalize_city(label, canonical_map):
     return None
 
 def parse_category_from_key(key_val: str) -> str | None:
-    """
-    key_city_category is like "Avenida Balboa | Utilities".
-    Return the part after the last ' | '.
-    """
+    """key_city_category is like 'Avenida Balboa | Utilities' -> returns 'Utilities' normalized."""
     if not key_val:
         return None
     parts = [p.strip() for p in str(key_val).split("|")]
@@ -184,7 +175,8 @@ def fetch_overrides(env, canonical_map, debug=False):
     piv = {}
     total = skipped = 0
     labels_before, labels_after = set(), set()
-    raw_cat_seen = set()
+    raw_cat_keys_seen = set()
+    qa_rows = []  # for --dump-overrides
 
     for rec in fetch_all_records(
         env["AIRTABLE_BASE"], env["AIRTABLE_OVERRIDES_TABLE"], env["AIRTABLE_TOKEN"],
@@ -193,36 +185,52 @@ def fetch_overrides(env, canonical_map, debug=False):
         total += 1
         f = rec.get("fields", {})
 
-        if "active" in f and not f.get("active"):
-            skipped += 1; continue
+        active = f.get("active", True)
+        eff    = normalize_single(f.get("effective_date", "")) or ""
+        city_raw = coalesce(normalize_single(f.get("city")), normalize_single(f.get("city_link")))
+        key_val  = normalize_single(f.get("key_city_category", "")) or ""
+        amt      = coalesce(f.get("final_value_usd"), f.get("override_usd")) or 0
 
-        raw_city = coalesce(normalize_single(f.get("city")), normalize_single(f.get("city_link")))
-        if not raw_city or (isinstance(raw_city, str) and raw_city.startswith("rec")):
-            skipped += 1; continue
+        reason = ""
+        if "active" in f and not active:
+            reason = "inactive"
+        elif not city_raw or (isinstance(city_raw, str) and city_raw.startswith("rec")):
+            reason = "unresolved city"
+        else:
+            canon = canonicalize_city(city_raw, canonical_map)
+            if not canon:
+                reason = "city not in rents/aliases"
+            else:
+                raw_cat_keys_seen.add(key_val)
+                cat = parse_category_from_key(key_val)
+                if not cat:
+                    reason = "category unmapped"
+                else:
+                    # success
+                    labels_before.add(str(city_raw).strip())
+                    labels_after.add(canon)
+                    if canon not in piv:
+                        piv[canon] = {c: 0 for c in CATEGORIES}
+                    piv[canon][cat] = amt
 
-        labels_before.add(str(raw_city).strip())
-        canon = canonicalize_city(raw_city, canonical_map)
-        if not canon:
-            skipped += 1; continue
+        qa_rows.append({
+            "city_raw": str(city_raw) if city_raw else "",
+            "canonical_city": canonicalize_city(city_raw, canonical_map) if city_raw else "",
+            "key_city_category": key_val,
+            "parsed_category": parse_category_from_key(key_val) if key_val else "",
+            "amount_usd": amt,
+            "effective_date": eff,
+            "active": bool(active),
+            "skip_reason": reason,
+        })
 
-        key_val = normalize_single(f.get("key_city_category", "")) or ""
-        raw_cat_seen.add(key_val)
-        cat = parse_category_from_key(key_val)
-        if not cat:
-            skipped += 1; continue
-
-        amt = coalesce(f.get("final_value_usd"), f.get("override_usd")) or 0
-
-        labels_after.add(canon)
-        if canon not in piv:
-            piv[canon] = {c: 0 for c in CATEGORIES}
-        piv[canon][cat] = amt
+        if reason:
+            skipped += 1
 
     if debug:
-        # Show the unique category keys we parsed, to quickly spot mismatches
-        samples = sorted(list(raw_cat_seen))[:10]
+        samples = sorted(list(raw_cat_keys_seen))[:10]
         print(f"DEBUG key_city_category samples: {samples}")
-    return piv, total, skipped, labels_before, labels_after
+    return piv, total, skipped, labels_before, labels_after, qa_rows
 
 def merge_rents_overrides(rents, overrides_by_city):
     merged, applied = [], 0
@@ -237,11 +245,13 @@ def merge_rents_overrides(rents, overrides_by_city):
     return merged, applied
 
 # ====== IO / Git ======
-def write_csv_atomic(rows, path: Path):
+def write_csv_atomic(rows, path: Path, headers=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = Path(str(path) + ".tmp")
     with tmp.open("w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=CSV_HEADERS)
+        if headers is None:
+            headers = CSV_HEADERS
+        w = csv.DictWriter(fh, fieldnames=headers)
         w.writeheader(); w.writerows(rows)
     os.replace(tmp, path)
     print(f"✅ Wrote {len(rows)} rows to {path}")
@@ -287,17 +297,43 @@ def main():
     ap.add_argument("--force-snapshot", action="store_true")
     ap.add_argument("--no-push", action="store_true")
     ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--dump-overrides", action="store_true", help="Write QA dump of overrides used/skipped.")
+    ap.add_argument("--dump-rents", action="store_true", help="Write QA dump of rents pulled.")
     ap.add_argument("-m", "--commit-message", default=None)
     args = ap.parse_args()
 
+    # 1) Rents + canonical map
     rents = fetch_rents(env)
     canonical_map = build_canonical_city_map(rents)
-    overrides, total, skipped, before, after = fetch_overrides(env, canonical_map, debug=args.debug)
+
+    # 2) Overrides (mapped to canonical city names) + QA rows
+    overrides, total, skipped, before, after, qa_rows = fetch_overrides(env, canonical_map, debug=args.debug)
+
+    # 3) Merge
     rows, applied = merge_rents_overrides(rents, overrides)
 
+    # 4) Write main CSV
     write_csv_atomic(rows, CSV_PATH)
-    files_to_commit = [CSV_PATH]
 
+    # 5) Optional QA dumps
+    if args.dump_rents:
+        QA_DIR.mkdir(parents=True, exist_ok=True)
+        rent_dump = [
+            {"Date": r["Date"], "City/Neighborhood": r["City/Neighborhood"], "Configuration": r["Configuration"], "Average Price (USD)": r["Average Price (USD)"]}
+            for r in rents
+        ]
+        write_csv_atomic(rent_dump, QA_DIR / f"rents_dump_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                         headers=["Date","City/Neighborhood","Configuration","Average Price (USD)"])
+    if args.dump_overrides:
+        QA_DIR.mkdir(parents=True, exist_ok=True)
+        write_csv_atomic(
+            qa_rows,
+            QA_DIR / f"overrides_dump_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            headers=["city_raw","canonical_city","key_city_category","parsed_category","amount_usd","effective_date","active","skip_reason"]
+        )
+
+    # 6) Snapshot
+    files_to_commit = [CSV_PATH]
     if not args.no_snapshot:
         snap_path = snapshot_path_from_rows(rows)
         snap_path.parent.mkdir(parents=True, exist_ok=True)
@@ -307,6 +343,7 @@ def main():
             write_csv_atomic(rows, snap_path)
         files_to_commit.append(snap_path)
 
+    # 7) Debug summary
     if args.debug:
         print(f"DEBUG overrides: total={total}, skipped={skipped}, mapped_cities={len(after)}")
         if before: print("DEBUG sample override labels:", sorted(list(before))[:8])
@@ -320,6 +357,7 @@ def main():
         else:
             print("DEBUG no non-zero merged rows found.")
 
+    # 8) Commit/push
     msg = args.commit_message or f"Update rent CSV (+snapshot) ({time.strftime('%Y-%m-%d %H:%M')})"
     git_commit_and_push(REPO_DIR, files_to_commit, msg, push=not args.no_push)
 
