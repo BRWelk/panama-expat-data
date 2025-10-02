@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# push_csv.py — build CSV → git commit/push → Airtable upsert (one script)
+# push_csv.py — build CSV → git commit/push → Airtable update-by-lookup (no writing computed fields)
 
 import os, re, sys, csv, json, subprocess, requests, argparse
 from pathlib import Path
@@ -43,12 +43,6 @@ def get_env():
 # CSV BUILD (replace with your real generator if needed)
 # ---------------------------
 def build_csv_if_needed(skip_build: bool) -> None:
-    """
-    Default behavior: if --skip-build is passed we do nothing.
-    If not skipping and CSV already exists, we keep it (you may replace with your true generator).
-    If not skipping and CSV is missing, we create an empty headered CSV (so pipeline still runs).
-    Replace this function with your real builder if you want automatic regeneration.
-    """
     if skip_build:
         print("⏭️  Skipping CSV build (per flag).")
         return
@@ -94,15 +88,12 @@ def run(cmd, cwd=None, check=True):
 
 def ensure_git_setup():
     run(["git", "--version"])
-    # ensure we're in a repo
     run(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(REPO_DIR))
 
 def git_commit_and_push(commit_msg: str):
     run(["git", "add", str(CSV_OUT)], cwd=str(REPO_DIR))
-    # include snapshot if present
     for p in SNAPSHOT_DIR.glob("panama_rent_averages_*.csv"):
         run(["git", "add", str(p)], cwd=str(REPO_DIR))
-    # commit (no error if nothing to commit)
     res = subprocess.run(["git", "commit", "-m", commit_msg], cwd=str(REPO_DIR), capture_output=True, text=True)
     if "nothing to commit" in (res.stdout + res.stderr).lower():
         print("ℹ️ Nothing to commit.")
@@ -112,127 +103,137 @@ def git_commit_and_push(commit_msg: str):
     print("🚀 Pushed to origin.")
 
 # ---------------------------
-# Airtable upsert (mapped to your table fields)
+# Airtable update-by-lookup (PATCH only editable fields)
 # ---------------------------
-def airtable_upsert_from_csv(env: dict) -> None:
+def airtable_update_by_lookup(env: dict) -> None:
     token = env.get("AIRTABLE_TOKEN")
     base  = env.get("AIRTABLE_BASE")
-    # Prefer table ID vars; fall back to name var; then "Rent"
     table = env.get("AIRTABLE_RENTS_TABLE") or env.get("AIRTABLE_TABLE") or "Rent"
 
     if not (token and base and table):
-        print("⚠️  Skipping Airtable upsert: missing AIRTABLE_TOKEN / AIRTABLE_BASE / table id/name")
+        print("⚠️  Skipping Airtable update: missing AIRTABLE_TOKEN / AIRTABLE_BASE / table id/name")
         return
     if not CSV_OUT.exists():
-        print(f"⚠️  Skipping Airtable upsert: CSV not found at {CSV_OUT}")
+        print(f"⚠️  Skipping Airtable update: CSV not found at {CSV_OUT}")
         return
 
-    # We detected these fields in your table earlier:
-    # ['active','average_price_usd','bathrooms (from config_label)',
-    #  'bedrooms (from config_label)','city','city_link','config_label','currency','effective_date']
-    # Map ONLY overlapping columns; ignore Utilities/Groceries/etc (not present in table).
-    FIELD_MAP = {
-        "Date": ("effective_date", "date"),
-        "City/Neighborhood": ("city", "str"),
-        "Configuration": ("config_label", "str"),
-        "Average Price (USD)": ("average_price_usd", "num"),
-    }
-    PRIMARY_KEY_FIELDS = ["effective_date", "city", "config_label"]  # merge key
-    NUMERIC_TARGETS = {"average_price_usd"}
+    # Editable target fields in your table
+    TARGET_NUM_FIELD = "average_price_usd"   # numeric
+    TARGET_CITY      = "city"                # text
+    TARGET_CONFIG    = "config_label"        # likely computed/lookup (do NOT write)
+    TARGET_DATE      = "effective_date"      # date
+    OPTIONAL_CURRENCY= "currency"            # text
+    OPTIONAL_ACTIVE  = "active"              # checkbox/bool
 
-    # Load CSV & headers
+    # Load CSV
     with open(CSV_OUT, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
-        csv_headers = [h.strip() for h in (rows[0].keys() if rows else [])]
 
-    # Probe Airtable table fields (via sample records)
     base_url = f"https://api.airtable.com/v0/{base}/{quote(str(table), safe='')}"
-    hdrs = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    probe = requests.get(base_url, headers=hdrs, params={"maxRecords": 3}, timeout=30)
-    if probe.status_code >= 300:
-        print("❌ Could not probe Airtable table:", probe.status_code, probe.text)
-        raise SystemExit(1)
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
 
-    recs = probe.json().get("records", [])
-    table_fields = set()
-    for r in recs:
-        table_fields.update((r.get("fields") or {}).keys())
-
-    # Verify merge keys exist in the table (unless table empty)
-    if table_fields and not set(PRIMARY_KEY_FIELDS).issubset(table_fields):
-        print("❌ Merge keys not present in Airtable table:", PRIMARY_KEY_FIELDS)
-        print("   Table fields:", sorted(table_fields))
-        raise SystemExit(1)
-
-    # Coercion
-    def coerce_to_target(tgt_name, typ, val):
-        if val is None or val == "":
-            return None
-        if typ == "date":
-            for fmt in ("%m/%d/%Y","%Y-%m-%d","%m/%d/%y"):
-                try:
-                    return datetime.strptime(val, fmt).strftime("%Y-%m-%d")
-                except:
-                    pass
-            return val
-        if typ == "num" or tgt_name in NUMERIC_TARGETS:
+    def fmt_date(val: str) -> str:
+        if not val: return val
+        for fmt in ("%m/%d/%Y","%Y-%m-%d","%m/%d/%y"):
             try:
-                return float(str(val).replace(",", ""))
+                return datetime.strptime(val, fmt).strftime("%Y-%m-%d")
             except:
-                return val
-        # strings & passthrough
+                pass
         return val
 
-    # Build records (map only columns whose targets exist in the table)
-    payload_records = []
+    def to_float(v):
+        try:
+            return float(str(v).replace(",", ""))
+        except:
+            return v
+
+    total = len(rows)
+    updated = 0
+    missing = 0
+    failures = 0
+
     for r in rows:
-        fields = {}
+        csv_city   = r.get("City/Neighborhood","")
+        csv_cfg    = r.get("Configuration","")
+        csv_date   = fmt_date(r.get("Date",""))
+        csv_price  = to_float(r.get("Average Price (USD)",""))
 
-        # CSV → mapped fields
-        for csv_name, (target_name, typ) in FIELD_MAP.items():
-            if csv_name in r and (not table_fields or target_name in table_fields):
-                fields[target_name] = coerce_to_target(target_name, typ, r[csv_name])
+        if not (csv_city and csv_cfg and csv_date):
+            # Skip incomplete rows
+            continue
 
-        # Optional defaults if columns exist
-        if "currency" in table_fields:
-            fields.setdefault("currency", "USD")
-        if "active" in table_fields and "active" not in fields:
-            fields["active"] = True
+        # Build filterByFormula to find existing record
+        # Compare date as string "YYYY-MM-DD"
+        formula = f"AND(" \
+                  f"{{{TARGET_CITY}}}='{csv_city.replace(\"'\",\"\\'\")}'," \
+                  f"{{{TARGET_CONFIG}}}='{csv_cfg.replace(\"'\",\"\\'\")}'," \
+                  f"{{{TARGET_DATE}}}='{csv_date}')"  # Airtable parses ISO date string
 
-        if fields:
-            payload_records.append({"fields": fields})
+        try:
+            search = requests.get(
+                base_url,
+                headers=headers,
+                params={"maxRecords": 1, "filterByFormula": formula},
+                timeout=30
+            )
+            if search.status_code >= 300:
+                print("❌ Lookup error:", search.status_code, search.text)
+                failures += 1
+                continue
 
-    if not payload_records:
-        print("⚠️  No rows to upsert after mapping (headers mismatch or empty CSV).")
-        return
+            data = search.json()
+            recs = data.get("records", [])
+            if not recs:
+                # Cannot create because config_label is non-writable/computed
+                print(f"⚠️  No existing record for ({csv_city}, {csv_cfg}, {csv_date}); skipped create.")
+                missing += 1
+                continue
 
-    # Upsert in chunks
-    upsert_url = f"{base_url}?typecast=true"
-    headers_json = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload_template = {"performUpsert": {"fieldsToMergeOn": [{"fieldName": n} for n in PRIMARY_KEY_FIELDS]}}
+            rec_id = recs[0]["id"]
 
-    sent = 0
-    for i in range(0, len(payload_records), 10):
-        batch = payload_records[i:i+10]
-        payload = dict(payload_template)
-        payload["records"] = batch
-        res = requests.patch(upsert_url, headers=headers_json, data=json.dumps(payload), timeout=30)
-        if res.status_code >= 300:
-            print("❌ Airtable error:", res.status_code, res.text)
-            print("   Example record:", json.dumps(batch[0], ensure_ascii=False))
-            raise SystemExit(1)
-        sent += len(batch)
+            # Prepare PATCH with only editable fields
+            patch_fields = { TARGET_NUM_FIELD: csv_price }
+            # Optional defaults if the fields exist
+            # (We don't know schema perfectly here, so try & ignore 422 due to unknown field)
+            patch_fields[OPTIONAL_CURRENCY] = "USD"
+            patch_fields[OPTIONAL_ACTIVE]   = True
 
-    print(f"✅ Upserted {sent} records into Airtable table '{table}' using keys {PRIMARY_KEY_FIELDS}.")
+            patch = requests.patch(
+                f"{base_url}/{rec_id}",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                data=json.dumps({"fields": patch_fields, "typecast": True}),
+                timeout=30
+            )
+            if patch.status_code >= 300:
+                # Retry without optional fields in case they don't exist
+                patch_fields_fallback = { TARGET_NUM_FIELD: csv_price }
+                patch2 = requests.patch(
+                    f"{base_url}/{rec_id}",
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    data=json.dumps({"fields": patch_fields_fallback, "typecast": True}),
+                    timeout=30
+                )
+                if patch2.status_code >= 300:
+                    print("❌ Update error:", patch2.status_code, patch2.text)
+                    failures += 1
+                    continue
+
+            updated += 1
+
+        except Exception as e:
+            print("❌ Exception during update:", repr(e))
+            failures += 1
+
+    print(f"✅ Airtable update complete. Updated: {updated} | Missing (not created): {missing} | Failures: {failures} | Total CSV rows: {total}")
 
 # ---------------------------
 # Main
 # ---------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Build CSV → git push → Airtable upsert")
+    parser = argparse.ArgumentParser(description="Build CSV → git push → Airtable update-by-lookup")
     parser.add_argument("--skip-build", action="store_true", help="Skip CSV build step")
     parser.add_argument("--force-snapshot", action="store_true", help="Overwrite this month's snapshot")
-    parser.add_argument("--skip-airtable", action="store_true", help="Skip Airtable upsert step")
+    parser.add_argument("--skip-airtable", action="store_true", help="Skip Airtable update step")
     parser.add_argument("--commit-msg", default="Update rent CSV and snapshot", help="Custom git commit message")
     args = parser.parse_args()
 
@@ -250,15 +251,16 @@ def main():
     ensure_git_setup()
     git_commit_and_push(args.commit_msg)
 
-    # 4) Airtable upsert
+    # 4) Airtable update-by-lookup
     if not args.skip_airtable:
         print("↗️  Pushing latest CSV to Airtable…")
-        airtable_upsert_from_csv(env)
+        airtable_update_by_lookup(env)
     else:
-        print("⏭️  Skipping Airtable upsert (per flag).")
+        print("⏭️  Skipping Airtable update (per flag).")
 
 if __name__ == "__main__":
     main()
+
 
 
 
