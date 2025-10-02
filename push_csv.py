@@ -162,12 +162,18 @@ def airtable_update_by_lookup(env: dict) -> None:
             # Skip incomplete rows
             continue
 
+        # Escape single quotes for Airtable formulas by doubling them (' -> '')
+        safe_city = csv_city.replace("'", "''")
+        safe_cfg  = csv_cfg.replace("'", "''")
+
         # Build filterByFormula to find existing record
-        # Compare date as string "YYYY-MM-DD"
-        formula = f"AND(" \
-                  f"{{{TARGET_CITY}}}='{csv_city.replace(\"'\",\"\\'\")}'," \
-                  f"{{{TARGET_CONFIG}}}='{csv_cfg.replace(\"'\",\"\\'\")}'," \
-                  f"{{{TARGET_DATE}}}='{csv_date}')"  # Airtable parses ISO date string
+        formula = (
+            f"AND("
+            f"{{{TARGET_CITY}}}='{safe_city}',"
+            f"{{{TARGET_CONFIG}}}='{safe_cfg}',"
+            f"{{{TARGET_DATE}}}='{csv_date}'"
+            f")"
+        )
 
         try:
             search = requests.get(
