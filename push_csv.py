@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# push_csv.py — build CSV → git commit/push → Airtable update-by-lookup (no writing computed fields)
+# push_csv.py — commit/push CSV to GitHub, then sync to Airtable with linked records (Cities, Configs → Rents)
 
 import os, re, sys, csv, json, subprocess, requests, argparse
 from pathlib import Path
@@ -32,7 +32,6 @@ def parse_env_file(path: Path):
 
 def get_env():
     file_env = parse_env_file(ENV_PATH)
-    # process env takes precedence if set
     env = dict(file_env)
     for k in list(file_env.keys()):
         if k in os.environ and os.environ[k]:
@@ -40,7 +39,7 @@ def get_env():
     return env
 
 # ---------------------------
-# CSV BUILD (replace with your real generator if needed)
+# CSV BUILD (no-op unless missing; keep your generator elsewhere)
 # ---------------------------
 def build_csv_if_needed(skip_build: bool) -> None:
     if skip_build:
@@ -103,82 +102,132 @@ def git_commit_and_push(commit_msg: str):
     print("🚀 Pushed to origin.")
 
 # ---------------------------
-# Airtable update-by-lookup (PATCH only editable fields)
+# Airtable helpers
 # ---------------------------
-def airtable_update_by_lookup(env: dict) -> None:
+def at_base_url(base, table): return f"https://api.airtable.com/v0/{base}/{quote(str(table), safe='')}"
+def h_json(token): return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+def h_get(token):  return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+def fmt_date(val: str) -> str:
+    if not val: return val
+    for fmt in ("%m/%d/%Y","%Y-%m-%d","%m/%d/%y"):
+        try: return datetime.strptime(val, fmt).strftime("%Y-%m-%d")
+        except: pass
+    return val
+
+def to_float(v):
+    try: return float(str(v).replace(",", ""))
+    except: return v
+
+def find_record_id_by_name(token, base, table, primary_field, name):
+    """Find a record by its primary field text equal to name. Return record id or None."""
+    url = at_base_url(base, table)
+    name_safe = (name or "").replace("'", "''")
+    formula = f"{{{primary_field}}}='{name_safe}'"
+    r = requests.get(url, headers=h_get(token), params={"maxRecords": 1, "filterByFormula": formula}, timeout=30)
+    if r.status_code >= 300:
+        raise RuntimeError(f"Lookup error [{table}]: {r.status_code} {r.text}")
+    recs = r.json().get("records", [])
+    return recs[0]["id"] if recs else None
+
+def create_record_by_name(token, base, table, primary_field, name, extra_fields=None):
+    """Create a record setting the primary field to name."""
+    url = at_base_url(base, table)
+    fields = {primary_field: name}
+    if extra_fields:
+        fields.update(extra_fields)
+    r = requests.post(url, headers=h_json(token), data=json.dumps({"fields": fields, "typecast": True}), timeout=30)
+    if r.status_code >= 300:
+        raise RuntimeError(f"Create error [{table}]: {r.status_code} {r.text}")
+    return r.json()["id"]
+
+def get_or_create_linked(token, base, table, primary_field, name, extra_fields=None):
+    """Return record id in linked table; create it if missing."""
+    rec_id = find_record_id_by_name(token, base, table, primary_field, name)
+    if rec_id: return rec_id
+    return create_record_by_name(token, base, table, primary_field, name, extra_fields=extra_fields)
+
+# ---------------------------
+# Airtable sync with linked records
+# ---------------------------
+def airtable_sync_linked(env: dict) -> None:
     token = env.get("AIRTABLE_TOKEN")
     base  = env.get("AIRTABLE_BASE")
-    table = env.get("AIRTABLE_RENTS_TABLE") or env.get("AIRTABLE_TABLE") or "Rent"
+    rents_table   = env.get("AIRTABLE_RENTS_TABLE")   or env.get("AIRTABLE_TABLE") or "Rents"
+    cities_table  = env.get("AIRTABLE_CITIES_TABLE")  or "Cities"
+    configs_table = env.get("AIRTABLE_CONFIGS_TABLE") or "Configs"
 
-    if not (token and base and table):
-        print("⚠️  Skipping Airtable update: missing AIRTABLE_TOKEN / AIRTABLE_BASE / table id/name")
+    # primary field names in those tables (adjust if different)
+    CITY_PRIMARY    = env.get("AIRTABLE_CITIES_PRIMARY")  or "city"
+    CONFIG_PRIMARY  = env.get("AIRTABLE_CONFIGS_PRIMARY") or "config_label"
+
+    if not (token and base and rents_table and cities_table and configs_table):
+        print("⚠️  Skipping Airtable sync: missing AIRTABLE_* env values")
         return
     if not CSV_OUT.exists():
-        print(f"⚠️  Skipping Airtable update: CSV not found at {CSV_OUT}")
+        print(f"⚠️  Skipping Airtable sync: CSV not found at {CSV_OUT}")
         return
 
-    # Editable target fields in your table
-    TARGET_NUM_FIELD = "average_price_usd"   # numeric
-    TARGET_CITY      = "city"                # text
-    TARGET_CONFIG    = "config_label"        # likely computed/lookup (do NOT write)
-    TARGET_DATE      = "effective_date"      # date
-    OPTIONAL_CURRENCY= "currency"            # text
-    OPTIONAL_ACTIVE  = "active"              # checkbox/bool
+    # field names on Rents table
+    F_CITY   = "city"             # linked to Cities
+    F_CONFIG = "config_label"     # linked to Configs
+    F_DATE   = "effective_date"   # date
+    F_PRICE  = "average_price_usd"  # number
+    F_CURR   = "currency"         # text (optional)
+    F_ACTIVE = "active"           # checkbox (optional)
 
-    # Load CSV
+    # cache for lookups to reduce API calls
+    city_cache = {}
+    config_cache = {}
+
+    # load CSV
     with open(CSV_OUT, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
 
-    base_url = f"https://api.airtable.com/v0/{base}/{quote(str(table), safe='')}"
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-
-    def fmt_date(val: str) -> str:
-        if not val: return val
-        for fmt in ("%m/%d/%Y","%Y-%m-%d","%m/%d/%y"):
-            try:
-                return datetime.strptime(val, fmt).strftime("%Y-%m-%d")
-            except:
-                pass
-        return val
-
-    def to_float(v):
-        try:
-            return float(str(v).replace(",", ""))
-        except:
-            return v
-
+    rents_url = at_base_url(base, rents_table)
     total = len(rows)
     updated = 0
-    missing = 0
+    created = 0
     failures = 0
 
     for r in rows:
-        csv_city   = r.get("City/Neighborhood","")
-        csv_cfg    = r.get("Configuration","")
-        csv_date   = fmt_date(r.get("Date",""))
-        csv_price  = to_float(r.get("Average Price (USD)",""))
+        city_name  = (r.get("City/Neighborhood") or "").strip()
+        cfg_label  = (r.get("Configuration") or "").strip()
+        eff_date   = fmt_date(r.get("Date") or "")
+        price_val  = to_float(r.get("Average Price (USD)"))
 
-        if not (csv_city and csv_cfg and csv_date):
-            # Skip incomplete rows
+        if not (city_name and cfg_label and eff_date):
             continue
 
-        # Escape single quotes for Airtable formulas by doubling them (' -> '')
-        safe_city = csv_city.replace("'", "''")
-        safe_cfg  = csv_cfg.replace("'", "''")
+        # --- ensure linked City & Config exist, get their record IDs
+        try:
+            if city_name not in city_cache:
+                city_cache[city_name] = get_or_create_linked(token, base, cities_table, CITY_PRIMARY, city_name)
+            city_id = city_cache[city_name]
 
-        # Build filterByFormula to find existing record
+            if cfg_label not in config_cache:
+                config_cache[cfg_label] = get_or_create_linked(token, base, configs_table, CONFIG_PRIMARY, cfg_label)
+            config_id = config_cache[cfg_label]
+        except Exception as e:
+            print("❌ Linked record error:", repr(e))
+            failures += 1
+            continue
+
+        # --- find existing Rents record (match by linked names + date)
+        # We can match by the *display* text of linked fields using ARRAYJOIN in formula.
+        safe_city = city_name.replace("'", "''")
+        safe_cfg  = cfg_label.replace("'", "''")
         formula = (
             f"AND("
-            f"{{{TARGET_CITY}}}='{safe_city}',"
-            f"{{{TARGET_CONFIG}}}='{safe_cfg}',"
-            f"{{{TARGET_DATE}}}='{csv_date}'"
+            f"ARRAYJOIN({{{F_CITY}}})='{safe_city}',"
+            f"ARRAYJOIN({{{F_CONFIG}}})='{safe_cfg}',"
+            f"{{{F_DATE}}}='{eff_date}'"
             f")"
         )
 
         try:
             search = requests.get(
-                base_url,
-                headers=headers,
+                rents_url, headers=h_get(token),
                 params={"maxRecords": 1, "filterByFormula": formula},
                 timeout=30
             )
@@ -187,59 +236,61 @@ def airtable_update_by_lookup(env: dict) -> None:
                 failures += 1
                 continue
 
-            data = search.json()
-            recs = data.get("records", [])
-            if not recs:
-                # Cannot create because config_label is non-writable/computed
-                print(f"⚠️  No existing record for ({csv_city}, {csv_cfg}, {csv_date}); skipped create.")
-                missing += 1
-                continue
+            recs = search.json().get("records", [])
+            fields_payload = {
+                F_CITY:   [{"id": city_id}],
+                F_CONFIG: [{"id": config_id}],
+                F_DATE:    eff_date,
+                F_PRICE:   price_val,
+            }
+            # optional defaults if present in schema
+            fields_payload[F_CURR] = "USD"
+            fields_payload[F_ACTIVE] = True
 
-            rec_id = recs[0]["id"]
-
-            # Prepare PATCH with only editable fields
-            patch_fields = { TARGET_NUM_FIELD: csv_price }
-            # Optional defaults if the fields exist
-            # (We don't know schema perfectly here, so try & ignore 422 due to unknown field)
-            patch_fields[OPTIONAL_CURRENCY] = "USD"
-            patch_fields[OPTIONAL_ACTIVE]   = True
-
-            patch = requests.patch(
-                f"{base_url}/{rec_id}",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                data=json.dumps({"fields": patch_fields, "typecast": True}),
-                timeout=30
-            )
-            if patch.status_code >= 300:
-                # Retry without optional fields in case they don't exist
-                patch_fields_fallback = { TARGET_NUM_FIELD: csv_price }
-                patch2 = requests.patch(
-                    f"{base_url}/{rec_id}",
-                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                    data=json.dumps({"fields": patch_fields_fallback, "typecast": True}),
-                    timeout=30
-                )
-                if patch2.status_code >= 300:
-                    print("❌ Update error:", patch2.status_code, patch2.text)
-                    failures += 1
-                    continue
-
-            updated += 1
+            if recs:
+                # UPDATE existing
+                rec_id = recs[0]["id"]
+                r_patch = requests.patch(f"{rents_url}/{rec_id}", headers=h_json(token),
+                                         data=json.dumps({"fields": fields_payload, "typecast": True}), timeout=30)
+                if r_patch.status_code >= 300:
+                    # fallback without optional fields
+                    minimal = {F_CITY: [{"id": city_id}], F_CONFIG: [{"id": config_id}], F_DATE: eff_date, F_PRICE: price_val}
+                    r_patch2 = requests.patch(f"{rents_url}/{rec_id}", headers=h_json(token),
+                                              data=json.dumps({"fields": minimal, "typecast": True}), timeout=30)
+                    if r_patch2.status_code >= 300:
+                        print("❌ Update error:", r_patch2.status_code, r_patch2.text)
+                        failures += 1
+                        continue
+                updated += 1
+            else:
+                # CREATE new
+                r_post = requests.post(rents_url, headers=h_json(token),
+                                       data=json.dumps({"fields": fields_payload, "typecast": True}), timeout=30)
+                if r_post.status_code >= 300:
+                    # fallback without optional fields
+                    minimal = {F_CITY: [{"id": city_id}], F_CONFIG: [{"id": config_id}], F_DATE: eff_date, F_PRICE: price_val}
+                    r_post2 = requests.post(rents_url, headers=h_json(token),
+                                            data=json.dumps({"fields": minimal, "typecast": True}), timeout=30)
+                    if r_post2.status_code >= 300:
+                        print("❌ Create error:", r_post2.status_code, r_post2.text)
+                        failures += 1
+                        continue
+                created += 1
 
         except Exception as e:
-            print("❌ Exception during update:", repr(e))
+            print("❌ Exception during create/update:", repr(e))
             failures += 1
 
-    print(f"✅ Airtable update complete. Updated: {updated} | Missing (not created): {missing} | Failures: {failures} | Total CSV rows: {total}")
+    print(f"✅ Airtable sync complete. Updated: {updated} | Created: {created} | Failures: {failures} | Total CSV rows: {total}")
 
 # ---------------------------
 # Main
 # ---------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Build CSV → git push → Airtable update-by-lookup")
+    parser = argparse.ArgumentParser(description="Build CSV → git push → Airtable sync with linked records")
     parser.add_argument("--skip-build", action="store_true", help="Skip CSV build step")
     parser.add_argument("--force-snapshot", action="store_true", help="Overwrite this month's snapshot")
-    parser.add_argument("--skip-airtable", action="store_true", help="Skip Airtable update step")
+    parser.add_argument("--skip-airtable", action="store_true", help="Skip Airtable sync step")
     parser.add_argument("--commit-msg", default="Update rent CSV and snapshot", help="Custom git commit message")
     args = parser.parse_args()
 
@@ -257,15 +308,16 @@ def main():
     ensure_git_setup()
     git_commit_and_push(args.commit_msg)
 
-    # 4) Airtable update-by-lookup
+    # 4) Airtable sync (linked records)
     if not args.skip_airtable:
-        print("↗️  Pushing latest CSV to Airtable…")
-        airtable_update_by_lookup(env)
+        print("↗️  Syncing CSV to Airtable (Cities/Configs → Rents)…")
+        airtable_sync_linked(env)
     else:
-        print("⏭️  Skipping Airtable update (per flag).")
+        print("⏭️  Skipping Airtable sync (per flag).")
 
 if __name__ == "__main__":
     main()
+
 
 
 
