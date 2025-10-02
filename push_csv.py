@@ -1,368 +1,239 @@
 #!/usr/bin/env python3
-"""
-push_csv.py – Fetch Airtable (Rents + City Overrides) -> build unified CSV -> (optionally) commit & push
+# push_csv.py — build CSV → git commit/push → Airtable upsert (one script)
 
-Output schema (exact order):
-Date, City/Neighborhood, Configuration, Average Price (USD),
-Utilities, Groceries, Internet, Cell Phone, Dining, Entertainment, Travel
-"""
-
-import os, sys, csv, re, time, unicodedata, subprocess, requests, argparse
+import os, re, sys, csv, json, subprocess, requests, argparse
+from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote
-from pathlib import Path
 
-# ====== Paths ======
+# ---------------------------
+# Paths & constants
+# ---------------------------
 REPO_DIR = Path(__file__).resolve().parent
-DATA_DIR = REPO_DIR / "data"
-CSV_PATH = DATA_DIR / "panama_rent_averages.csv"
-HIST_DIR = DATA_DIR / "history"
-QA_DIR   = DATA_DIR / "QA"
 ENV_PATH = REPO_DIR / ".env.local"
-print(f"[RUNNING] {__file__}")
+CSV_OUT  = REPO_DIR / "data" / "panama_rent_averages.csv"
+SNAPSHOT_DIR = REPO_DIR / "data"
+SNAPSHOT_NAME_FMT = "panama_rent_averages_{yyyy}-{mm}.csv"  # e.g., ..._2025-10.csv
 
-# ====== CSV schema ======
-CSV_HEADERS = [
-    "Date","City/Neighborhood","Configuration","Average Price (USD)",
-    "Utilities","Groceries","Internet","Cell Phone","Dining","Entertainment","Travel",
-]
-CATEGORIES = ["Utilities","Groceries","Internet","Cell Phone","Dining","Entertainment","Travel"]
-
-# ---- Category normalization map (incoming -> canonical) ----
-CAT_MAP = {
-    "utilities": "Utilities", "utility": "Utilities",
-    "groceries": "Groceries", "grocery": "Groceries",
-    "internet": "Internet",
-    "cell phone": "Cell Phone", "cellphone": "Cell Phone", "mobile": "Cell Phone",
-    "dining": "Dining", "dining out": "Dining", "restaurants": "Dining",
-    "entertainment": "Entertainment",
-    "travel": "Travel", "transportation": "Travel",
-}
-
-# ---- Neighborhood → City aliases (keys lowercased/slugged) ----
-ALIASES = {
-    "avenida balboa": "Panama City",
-    "casco viejo": "Panama City",
-    # add more if needed (e.g., "costa del este": "Panama City")
-}
-
-# ====== env loader ======
+# ---------------------------
+# Env handling
+# ---------------------------
 def parse_env_file(path: Path):
     if not path.exists():
-        sys.exit(f".env.local not found at {path}")
-    secrets = {}
+        return {}
+    env = {}
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#") or "=" not in line: 
             continue
         k, v = line.split("=", 1)
-        v = re.sub(r"\s+#.*$", "", v).strip().strip('"').strip("'")
-        secrets[k.strip()] = v
-    return secrets
+        env[k.strip()] = re.sub(r"\s+#.*$", "", v).strip().strip('"').strip("'")
+    return env
 
-# ====== helpers ======
-def normalize_single(v):
-    return v[0] if isinstance(v, list) and len(v) == 1 else v
+def get_env():
+    file_env = parse_env_file(ENV_PATH)
+    # process env takes precedence if set
+    env = dict(file_env)
+    for k in list(file_env.keys()):
+        if k in os.environ and os.environ[k]:
+            env[k] = os.environ[k]
+    return env
 
-def looks_like_rec_ids(v):
-    return isinstance(v, list) and v and all(isinstance(x, str) and x.startswith("rec") for x in v)
+# ---------------------------
+# CSV BUILD (replace with your real generator if needed)
+# ---------------------------
+def build_csv_if_needed(skip_build: bool) -> None:
+    """
+    Default behavior: if --skip-build is passed we do nothing.
+    If not skipping and CSV already exists, we keep it (you may replace with your true generator).
+    If not skipping and CSV is missing, we create an empty headered CSV (so pipeline still runs).
+    Replace this function with your real builder if you want automatic regeneration.
+    """
+    if skip_build:
+        print("⏭️  Skipping CSV build (per flag).")
+        return
+    if CSV_OUT.exists():
+        print(f"✅ CSV exists: {CSV_OUT}")
+        return
+    print(f"⚠️  CSV not found; creating a header-only file at: {CSV_OUT}")
+    CSV_OUT.parent.mkdir(parents=True, exist_ok=True)
+    headers = [
+        "Date","City/Neighborhood","Configuration","Average Price (USD)",
+        "Utilities","Groceries","Internet","Cell Phone","Dining","Entertainment","Travel"
+    ]
+    with open(CSV_OUT, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
 
-def coalesce(*vals):
-    for v in vals:
-        if v is None: continue
-        if isinstance(v, str) and v.strip() == "": continue
-        if isinstance(v, list) and len(v) == 0: continue
-        return v
-    return None
+# ---------------------------
+# Snapshot
+# ---------------------------
+def write_monthly_snapshot(force_snapshot: bool) -> None:
+    yyyy = datetime.now().strftime("%Y")
+    mm   = datetime.now().strftime("%m")
+    snap_name = SNAPSHOT_NAME_FMT.format(yyyy=yyyy, mm=mm)
+    snap_path = SNAPSHOT_DIR / snap_name
+    if snap_path.exists() and not force_snapshot:
+        print(f"ℹ️ Snapshot exists, skipping: {snap_name} (use --force-snapshot to overwrite)")
+        return
+    data = CSV_OUT.read_bytes()
+    snap_path.write_bytes(data)
+    print(f"✅ Wrote snapshot: {snap_path}")
 
-def slug(s: str) -> str:
-    if s is None: return ""
-    s = str(s).strip()
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = re.sub(r"\s+", " ", s).lower()
-    return s
+# ---------------------------
+# Git helpers
+# ---------------------------
+def run(cmd, cwd=None, check=True):
+    res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, shell=False)
+    if check and res.returncode != 0:
+        print("❌ Command failed:", " ".join(cmd))
+        print(res.stdout)
+        print(res.stderr)
+        sys.exit(res.returncode)
+    return res
 
-def norm_cat(label: str) -> str | None:
-    """Normalize string label to our canonical CSV header."""
-    if not label: return None
-    key = re.sub(r"\s+", " ", str(label).strip().lower())
-    return CAT_MAP.get(key)
+def ensure_git_setup():
+    run(["git", "--version"])
+    # ensure we're in a repo
+    run(["git", "rev-parse", "--is-inside-work-tree"], cwd=str(REPO_DIR))
 
-def compute_configuration(fields):
-    raw = fields.get("config_label")
-    if looks_like_rec_ids(raw):
-        beds  = normalize_single(fields.get("bedrooms (from config_label)", ""))
-        baths = normalize_single(fields.get("bathrooms (from config_label)", ""))
-        return f"{beds} BR / {baths} BA" if beds != "" and baths != "" else ""
-    return normalize_single(raw) or ""
+def git_commit_and_push(commit_msg: str):
+    run(["git", "add", str(CSV_OUT)], cwd=str(REPO_DIR))
+    # include snapshot if present
+    for p in SNAPSHOT_DIR.glob("panama_rent_averages_*.csv"):
+        run(["git", "add", str(p)], cwd=str(REPO_DIR))
+    # commit (no error if nothing to commit)
+    res = subprocess.run(["git", "commit", "-m", commit_msg], cwd=str(REPO_DIR), capture_output=True, text=True)
+    if "nothing to commit" in (res.stdout + res.stderr).lower():
+        print("ℹ️ Nothing to commit.")
+    else:
+        print(res.stdout.strip() or res.stderr.strip())
+    run(["git", "push", "origin", "HEAD"], cwd=str(REPO_DIR))
+    print("🚀 Pushed to origin.")
 
-# ====== Airtable fetch ======
-def fetch_all_records(base, table, token, view=None, fields=None):
-    url = f"https://api.airtable.com/v0/{base}/{quote(table, safe='')}"
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    params = {}
-    if view: params["view"] = view
-    if fields:
-        for i, fld in enumerate(fields):
-            params[f"fields[{i}]"] = fld
-    offset = None
-    while True:
-        if offset: params["offset"] = offset
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        if resp.status_code != 200:
-            raise SystemExit(f"Airtable fetch failed {resp.status_code}: {resp.text[:600]}")
-        data = resp.json()
-        for rec in data.get("records", []):
-            yield rec
-        offset = data.get("offset")
-        if not offset: break
+# ---------------------------
+# Airtable upsert
+# ---------------------------
+def airtable_upsert_from_csv(env: dict) -> None:
+    token = env.get("AIRTABLE_TOKEN")
+    base  = env.get("AIRTABLE_BASE")
+    # Prefer table ID vars; fall back to name var; then "Rent"
+    table = env.get("AIRTABLE_RENTS_TABLE") or env.get("AIRTABLE_TABLE") or "Rent"
 
-RENTS_FIELDS = [
-    "effective_date","city","config_label",
-    "bedrooms (from config_label)","bathrooms (from config_label)",
-    "average_price_usd",
-]
+    if not (token and base and table):
+        print("⚠️  Skipping Airtable upsert: missing AIRTABLE_TOKEN / AIRTABLE_BASE / (AIRTABLE_RENTS_TABLE|AIRTABLE_TABLE)")
+        return
+    if not CSV_OUT.exists():
+        print(f"⚠️  Skipping Airtable upsert: CSV not found at {CSV_OUT}")
+        return
 
-# We cannot read the label from 'category' (returns rec IDs). Use key field: "key_city_category".
-OVERRIDES_FIELDS = [
-    "city","city_link",
-    "category",                  # rec IDs (ignored for label)
-    "key_city_category",         # e.g. "Avenida Balboa | Utilities"
-    "final_value_usd","override_usd",
-    "active","effective_date",
-]
+    FIELD_MAP = {
+        "Date": "Date",
+        "City/Neighborhood": "City/Neighborhood",
+        "Configuration": "Configuration",
+        "Average Price (USD)": "Average Price (USD)",
+        "Utilities": "Utilities",
+        "Groceries": "Groceries",
+        "Internet": "Internet",
+        "Cell Phone": "Cell Phone",
+        "Dining": "Dining",
+        "Entertainment": "Entertainment",
+        "Travel": "Travel",
+    }
+    PRIMARY_KEY_FIELDS = ["Date", "City/Neighborhood", "Configuration"]
+    NUMERIC_FIELDS = {"Average Price (USD)","Utilities","Groceries","Internet","Cell Phone","Dining","Entertainment","Travel"}
 
-def fetch_rents(env):
-    rows = []
-    for rec in fetch_all_records(
-        env["AIRTABLE_BASE"], env["AIRTABLE_RENTS_TABLE"], env["AIRTABLE_TOKEN"],
-        view=(env.get("AIRTABLE_RENTS_VIEW") or None), fields=RENTS_FIELDS
-    ):
-        f = rec.get("fields", {})
-        rows.append({
-            "Date":               normalize_single(f.get("effective_date", "")),
-            "City/Neighborhood":  str(normalize_single(f.get("city", ""))).strip(),
-            "Configuration":      compute_configuration(f),
-            "Average Price (USD)":normalize_single(f.get("average_price_usd", 0)) or 0,
-        })
-    return rows
-
-def build_canonical_city_map(rents_rows):
-    return { slug(r["City/Neighborhood"]): str(r["City/Neighborhood"]) for r in rents_rows }
-
-def canonicalize_city(label, canonical_map):
-    s = slug(label)
-    if not s: return None
-    if s in canonical_map:  # exact rents city
-        return canonical_map[s]
-    if s in ALIASES:        # neighborhood → city
-        target = slug(ALIASES[s])
-        return canonical_map.get(target, ALIASES[s])
-    return None
-
-def parse_category_from_key(key_val: str) -> str | None:
-    """key_city_category is like 'Avenida Balboa | Utilities' -> returns 'Utilities' normalized."""
-    if not key_val:
-        return None
-    parts = [p.strip() for p in str(key_val).split("|")]
-    if not parts:
-        return None
-    label = parts[-1]  # after last |
-    return norm_cat(label)
-
-def fetch_overrides(env, canonical_map, debug=False):
-    piv = {}
-    total = skipped = 0
-    labels_before, labels_after = set(), set()
-    raw_cat_keys_seen = set()
-    qa_rows = []  # for --dump-overrides
-
-    for rec in fetch_all_records(
-        env["AIRTABLE_BASE"], env["AIRTABLE_OVERRIDES_TABLE"], env["AIRTABLE_TOKEN"],
-        view=(env.get("AIRTABLE_OVERRIDES_VIEW") or None), fields=OVERRIDES_FIELDS
-    ):
-        total += 1
-        f = rec.get("fields", {})
-
-        active = f.get("active", True)
-        eff    = normalize_single(f.get("effective_date", "")) or ""
-        city_raw = coalesce(normalize_single(f.get("city")), normalize_single(f.get("city_link")))
-        key_val  = normalize_single(f.get("key_city_category", "")) or ""
-        amt      = coalesce(f.get("final_value_usd"), f.get("override_usd")) or 0
-
-        reason = ""
-        if "active" in f and not active:
-            reason = "inactive"
-        elif not city_raw or (isinstance(city_raw, str) and city_raw.startswith("rec")):
-            reason = "unresolved city"
-        else:
-            canon = canonicalize_city(city_raw, canonical_map)
-            if not canon:
-                reason = "city not in rents/aliases"
-            else:
-                raw_cat_keys_seen.add(key_val)
-                cat = parse_category_from_key(key_val)
-                if not cat:
-                    reason = "category unmapped"
-                else:
-                    # success
-                    labels_before.add(str(city_raw).strip())
-                    labels_after.add(canon)
-                    if canon not in piv:
-                        piv[canon] = {c: 0 for c in CATEGORIES}
-                    piv[canon][cat] = amt
-
-        qa_rows.append({
-            "city_raw": str(city_raw) if city_raw else "",
-            "canonical_city": canonicalize_city(city_raw, canonical_map) if city_raw else "",
-            "key_city_category": key_val,
-            "parsed_category": parse_category_from_key(key_val) if key_val else "",
-            "amount_usd": amt,
-            "effective_date": eff,
-            "active": bool(active),
-            "skip_reason": reason,
-        })
-
-        if reason:
-            skipped += 1
-
-    if debug:
-        samples = sorted(list(raw_cat_keys_seen))[:10]
-        print(f"DEBUG key_city_category samples: {samples}")
-    return piv, total, skipped, labels_before, labels_after, qa_rows
-
-def merge_rents_overrides(rents, overrides_by_city):
-    merged, applied = [], 0
-    for r in rents:
-        city = str(r["City/Neighborhood"]).strip()
-        o = overrides_by_city.get(city, {})
-        if o: applied += 1
-        row = dict(r)
-        for c in CATEGORIES:
-            row[c] = o.get(c, 0)
-        merged.append(row)
-    return merged, applied
-
-# ====== IO / Git ======
-def write_csv_atomic(rows, path: Path, headers=None):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = Path(str(path) + ".tmp")
-    with tmp.open("w", newline="", encoding="utf-8") as fh:
-        if headers is None:
-            headers = CSV_HEADERS
-        w = csv.DictWriter(fh, fieldnames=headers)
-        w.writeheader(); w.writerows(rows)
-    os.replace(tmp, path)
-    print(f"✅ Wrote {len(rows)} rows to {path}")
-
-def run(cmd, cwd=None):
-    return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True)
-
-def git_commit_and_push(repo_dir: Path, filepaths, message: str, push=True):
-    try:
-        filepaths = [str(p) for p in (filepaths if isinstance(filepaths, (list,tuple)) else [filepaths])]
-        run(["git", "add"] + filepaths, cwd=repo_dir)
-        diff = subprocess.run(["git", "status", "--porcelain", "--"] + filepaths, cwd=repo_dir, capture_output=True, text=True)
-        if not diff.stdout.strip():
-            print("ℹ️ No changes to commit."); return
-        run(["git", "commit", "-m", message], cwd=repo_dir)
-        if push:
-            run(["git", "push"], cwd=repo_dir); print("🚀 Pushed to origin.")
-        else:
-            print("📝 Committed locally (no push).")
-    except subprocess.CalledProcessError as e:
-        print("❌ Git error:\n", e.stderr or e.stdout); sys.exit(1)
-
-def snapshot_path_from_rows(rows):
-    yyyymm = datetime.today().strftime("%Y-%m")
-    dates = []
-    for r in rows:
-        d = str(r.get("Date","")).strip()
-        for fmt in ("%Y-%m-%d","%m/%d/%Y","%Y/%m/%d"):
+    def coerce(name, val):
+        if val is None or val == "": 
+            return None
+        if name == "Date":
+            for fmt in ("%m/%d/%Y","%Y-%m-%d","%m/%d/%y"):
+                try:
+                    return datetime.strptime(val, fmt).strftime("%Y-%m-%d")
+                except:
+                    pass
+            return val
+        if name in NUMERIC_FIELDS:
             try:
-                dates.append(datetime.strptime(d, fmt)); break
-            except Exception:
-                pass
-    if dates:
-        yyyymm = max(dates).strftime("%Y-%m")
-    return HIST_DIR / f"panama_rent_averages_{yyyymm}.csv"
+                return float(str(val).replace(",", ""))
+            except:
+                return val
+        return val
 
-# ====== Main ======
+    with open(CSV_OUT, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    records = []
+    for r in rows:
+        fields = {}
+        for csv_name, at_name in FIELD_MAP.items():
+            if csv_name in r:
+                fields[at_name] = coerce(at_name, r[csv_name])
+        if fields:
+            records.append({"fields": fields})
+
+    if not records:
+        print("⚠️  No rows to upsert (CSV empty?).")
+        return
+
+    url = f"https://api.airtable.com/v0/{base}/{quote(str(table), safe='')}?typecast=true"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    payload_template = {
+        "performUpsert": {"fieldsToMergeOn": [{"fieldName": k} for k in PRIMARY_KEY_FIELDS]}
+    }
+
+    def chunks(lst, n):
+        for i in range(0, len(lst), n):
+            yield lst[i:i+n]
+
+    sent = 0
+    for batch in chunks(records, 10):  # Airtable limit per request
+        payload = dict(payload_template)
+        payload["records"] = batch
+        res = requests.patch(url, headers=headers, data=json.dumps(payload), timeout=30)
+        if res.status_code >= 300:
+            print("❌ Airtable error:", res.status_code, res.text)
+            sys.exit(1)
+        sent += len(batch)
+
+    print(f"✅ Upserted {sent} records into Airtable table '{table}' (base {base}).")
+
+# ---------------------------
+# Main
+# ---------------------------
 def main():
-    env = parse_env_file(ENV_PATH)
+    parser = argparse.ArgumentParser(description="Build CSV → git push → Airtable upsert")
+    parser.add_argument("--skip-build", action="store_true", help="Skip CSV build step")
+    parser.add_argument("--force-snapshot", action="store_true", help="Overwrite this month's snapshot")
+    parser.add_argument("--skip-airtable", action="store_true", help="Skip Airtable upsert step")
+    parser.add_argument("--commit-msg", default="Update rent CSV and snapshot", help="Custom git commit message")
+    args = parser.parse_args()
 
-    ap = argparse.ArgumentParser(description="Fetch Airtable, merge, write CSV (+ monthly snapshot), commit & push.")
-    ap.add_argument("--no-snapshot", action="store_true")
-    ap.add_argument("--force-snapshot", action="store_true")
-    ap.add_argument("--no-push", action="store_true")
-    ap.add_argument("--debug", action="store_true")
-    ap.add_argument("--dump-overrides", action="store_true", help="Write QA dump of overrides used/skipped.")
-    ap.add_argument("--dump-rents", action="store_true", help="Write QA dump of rents pulled.")
-    ap.add_argument("-m", "--commit-message", default=None)
-    args = ap.parse_args()
+    print(f"[RUNNING] {__file__}")
 
-    # 1) Rents + canonical map
-    rents = fetch_rents(env)
-    canonical_map = build_canonical_city_map(rents)
+    # Load env
+    env = get_env()
 
-    # 2) Overrides (mapped to canonical city names) + QA rows
-    overrides, total, skipped, before, after, qa_rows = fetch_overrides(env, canonical_map, debug=args.debug)
+    # 1) Build/ensure CSV
+    build_csv_if_needed(skip_build=args.skip_build)
 
-    # 3) Merge
-    rows, applied = merge_rents_overrides(rents, overrides)
+    # 2) Snapshot (monthly)
+    write_monthly_snapshot(force_snapshot=args.force_snapshot)
 
-    # 4) Write main CSV
-    write_csv_atomic(rows, CSV_PATH)
+    # 3) Git push
+    ensure_git_setup()
+    git_commit_and_push(args.commit_msg)
 
-    # 5) Optional QA dumps
-    if args.dump_rents:
-        QA_DIR.mkdir(parents=True, exist_ok=True)
-        rent_dump = [
-            {"Date": r["Date"], "City/Neighborhood": r["City/Neighborhood"], "Configuration": r["Configuration"], "Average Price (USD)": r["Average Price (USD)"]}
-            for r in rents
-        ]
-        write_csv_atomic(rent_dump, QA_DIR / f"rents_dump_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                         headers=["Date","City/Neighborhood","Configuration","Average Price (USD)"])
-    if args.dump_overrides:
-        QA_DIR.mkdir(parents=True, exist_ok=True)
-        write_csv_atomic(
-            qa_rows,
-            QA_DIR / f"overrides_dump_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-            headers=["city_raw","canonical_city","key_city_category","parsed_category","amount_usd","effective_date","active","skip_reason"]
-        )
-
-    # 6) Snapshot
-    files_to_commit = [CSV_PATH]
-    if not args.no_snapshot:
-        snap_path = snapshot_path_from_rows(rows)
-        snap_path.parent.mkdir(parents=True, exist_ok=True)
-        if snap_path.exists() and not args.force_snapshot:
-            print(f"ℹ️ Snapshot exists, skipping: {snap_path.name} (use --force-snapshot to overwrite)")
-        else:
-            write_csv_atomic(rows, snap_path)
-        files_to_commit.append(snap_path)
-
-    # 7) Debug summary
-    if args.debug:
-        print(f"DEBUG overrides: total={total}, skipped={skipped}, mapped_cities={len(after)}")
-        if before: print("DEBUG sample override labels:", sorted(list(before))[:8])
-        if after:  print("DEBUG sample canonical cities:", sorted(list(after))[:8])
-        print(f"DEBUG rows with any overrides applied: {applied} / {len(rows)}")
-        # show one merged row with non-zero categories
-        for r in rows:
-            if any(str(r.get(c,'')).strip() not in ('','0','0.0') for c in CATEGORIES):
-                print("DEBUG example merged row:", {k: r[k] for k in ['City/Neighborhood','Configuration'] + CATEGORIES})
-                break
-        else:
-            print("DEBUG no non-zero merged rows found.")
-
-    # 8) Commit/push
-    msg = args.commit_message or f"Update rent CSV (+snapshot) ({time.strftime('%Y-%m-%d %H:%M')})"
-    git_commit_and_push(REPO_DIR, files_to_commit, msg, push=not args.no_push)
+    # 4) Airtable upsert
+    if not args.skip_airtable:
+        print("↗️  Pushing latest CSV to Airtable…")
+        airtable_upsert_from_csv(env)
+    else:
+        print("⏭️  Skipping Airtable upsert (per flag).")
 
 if __name__ == "__main__":
     main()
+
 
 
 
