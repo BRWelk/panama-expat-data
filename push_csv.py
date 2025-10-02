@@ -112,11 +112,12 @@ def git_commit_and_push(commit_msg: str):
     print("🚀 Pushed to origin.")
 
 # ---------------------------
-# Airtable upsert (auto-detect schema & merge keys)
+# Airtable upsert (mapped to your table fields)
 # ---------------------------
 def airtable_upsert_from_csv(env: dict) -> None:
     token = env.get("AIRTABLE_TOKEN")
     base  = env.get("AIRTABLE_BASE")
+    # Prefer table ID vars; fall back to name var; then "Rent"
     table = env.get("AIRTABLE_RENTS_TABLE") or env.get("AIRTABLE_TABLE") or "Rent"
 
     if not (token and base and table):
@@ -126,16 +127,18 @@ def airtable_upsert_from_csv(env: dict) -> None:
         print(f"⚠️  Skipping Airtable upsert: CSV not found at {CSV_OUT}")
         return
 
-    LONG_FIELDS = [
-        "Date","City/Neighborhood","Configuration","Average Price (USD)",
-        "Utilities","Groceries","Internet","Cell Phone","Dining","Entertainment","Travel"
-    ]
-    LONG_KEYS = ["Date","City/Neighborhood","Configuration"]
-    LONG_NUM = {"Average Price (USD)","Utilities","Groceries","Internet","Cell Phone","Dining","Entertainment","Travel"}
-
-    SHORT_FIELDS = ["City","Bedrooms","Range","USD_Rent"]
-    SHORT_KEYS = ["City","Bedrooms","Range"]
-    SHORT_NUM = {"USD_Rent"}
+    # We detected these fields in your table earlier:
+    # ['active','average_price_usd','bathrooms (from config_label)',
+    #  'bedrooms (from config_label)','city','city_link','config_label','currency','effective_date']
+    # Map ONLY overlapping columns; ignore Utilities/Groceries/etc (not present in table).
+    FIELD_MAP = {
+        "Date": ("effective_date", "date"),
+        "City/Neighborhood": ("city", "str"),
+        "Configuration": ("config_label", "str"),
+        "Average Price (USD)": ("average_price_usd", "num"),
+    }
+    PRIMARY_KEY_FIELDS = ["effective_date", "city", "config_label"]  # merge key
+    NUMERIC_TARGETS = {"average_price_usd"}
 
     # Load CSV & headers
     with open(CSV_OUT, newline="", encoding="utf-8") as f:
@@ -155,75 +158,55 @@ def airtable_upsert_from_csv(env: dict) -> None:
     for r in recs:
         table_fields.update((r.get("fields") or {}).keys())
 
-    def choose_schema():
-        csv_has_long = set(LONG_FIELDS).issubset(set(csv_headers))
-        csv_has_short = set(SHORT_FIELDS).issubset(set(csv_headers))
-        # prefer long if CSV supports it AND merge keys exist (or table empty)
-        if csv_has_long and (not table_fields or set(LONG_KEYS).issubset(table_fields)):
-            return "long"
-        if csv_has_short and (not table_fields or set(SHORT_KEYS).issubset(table_fields)):
-            return "short"
-        if not table_fields:
-            if csv_has_long: return "long"
-            if csv_has_short: return "short"
-        return None
-
-    schema = choose_schema()
-    if not schema:
-        print("❌ CSV ↔ Airtable mismatch.")
-        print("   CSV headers:", csv_headers)
-        print("   Sample Airtable fields:", sorted(table_fields) if table_fields else "(no rows yet)")
-        print("   Expected LONG:", LONG_FIELDS)
-        print("   Expected SHORT:", SHORT_FIELDS)
+    # Verify merge keys exist in the table (unless table empty)
+    if table_fields and not set(PRIMARY_KEY_FIELDS).issubset(table_fields):
+        print("❌ Merge keys not present in Airtable table:", PRIMARY_KEY_FIELDS)
+        print("   Table fields:", sorted(table_fields))
         raise SystemExit(1)
 
-    if schema == "long":
-        FIELD_MAP = {k: k for k in LONG_FIELDS}
-        PRIMARY_KEY_FIELDS = LONG_KEYS
-        NUMERIC_FIELDS = LONG_NUM
-    else:
-        FIELD_MAP = {k: k for k in SHORT_FIELDS}
-        PRIMARY_KEY_FIELDS = SHORT_KEYS
-        NUMERIC_FIELDS = SHORT_NUM
-
-    # If table has fields but is missing merge keys, try fallback to short
-    if table_fields and not set(PRIMARY_KEY_FIELDS).issubset(table_fields):
-        if schema == "long" and set(SHORT_KEYS).issubset(set(csv_headers)) and set(SHORT_KEYS).issubset(table_fields):
-            print("ℹ️ Merge keys for LONG schema not found in table; falling back to SHORT schema.")
-            FIELD_MAP = {k: k for k in SHORT_FIELDS}
-            PRIMARY_KEY_FIELDS = SHORT_KEYS
-            NUMERIC_FIELDS = SHORT_NUM
-            schema = "short"
-        else:
-            print("❌ Merge keys not present in Airtable table:", PRIMARY_KEY_FIELDS)
-            print("   Table fields:", sorted(table_fields))
-            raise SystemExit(1)
-
-    def coerce(name, val):
-        if val is None or val == "": return None
-        if name == "Date":
+    # Coercion
+    def coerce_to_target(tgt_name, typ, val):
+        if val is None or val == "":
+            return None
+        if typ == "date":
             for fmt in ("%m/%d/%Y","%Y-%m-%d","%m/%d/%y"):
-                try: return datetime.strptime(val, fmt).strftime("%Y-%m-%d")
-                except: pass
+                try:
+                    return datetime.strptime(val, fmt).strftime("%Y-%m-%d")
+                except:
+                    pass
             return val
-        if name in NUMERIC_FIELDS:
-            try: return float(str(val).replace(",", ""))
-            except: return val
+        if typ == "num" or tgt_name in NUMERIC_TARGETS:
+            try:
+                return float(str(val).replace(",", ""))
+            except:
+                return val
+        # strings & passthrough
         return val
 
+    # Build records (map only columns whose targets exist in the table)
     payload_records = []
     for r in rows:
         fields = {}
-        for csv_name, at_name in FIELD_MAP.items():
-            if csv_name in r:
-                fields[at_name] = coerce(at_name, r[csv_name])
+
+        # CSV → mapped fields
+        for csv_name, (target_name, typ) in FIELD_MAP.items():
+            if csv_name in r and (not table_fields or target_name in table_fields):
+                fields[target_name] = coerce_to_target(target_name, typ, r[csv_name])
+
+        # Optional defaults if columns exist
+        if "currency" in table_fields:
+            fields.setdefault("currency", "USD")
+        if "active" in table_fields and "active" not in fields:
+            fields["active"] = True
+
         if fields:
             payload_records.append({"fields": fields})
 
     if not payload_records:
-        print("⚠️  No rows to upsert (CSV empty or headers mismatch).")
+        print("⚠️  No rows to upsert after mapping (headers mismatch or empty CSV).")
         return
 
+    # Upsert in chunks
     upsert_url = f"{base_url}?typecast=true"
     headers_json = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     payload_template = {"performUpsert": {"fieldsToMergeOn": [{"fieldName": n} for n in PRIMARY_KEY_FIELDS]}}
@@ -240,7 +223,7 @@ def airtable_upsert_from_csv(env: dict) -> None:
             raise SystemExit(1)
         sent += len(batch)
 
-    print(f"✅ [{schema}] Upserted {sent} records into Airtable table '{table}'.")
+    print(f"✅ Upserted {sent} records into Airtable table '{table}' using keys {PRIMARY_KEY_FIELDS}.")
 
 # ---------------------------
 # Main
@@ -276,6 +259,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
